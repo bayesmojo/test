@@ -1,80 +1,87 @@
 import csv, os, re, time, zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs, quote
+from urllib.parse import urljoin, urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup
 
-BASE='https://master.get.com.tw/exam/List.aspx'
-CATEGORY='164'
-KEYWORD='統計'
+BASE='https://master.get.com.tw/exam/List.aspx'; CATEGORY='164'; KEYWORD='統計'
+HEAD={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.7'}
 OUT=Path('downloaded'); OUT.mkdir(exist_ok=True)
-s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.7'})
 
-def get(url, **kwargs):
+def page_url(p): return f'{BASE}?iPageNo={p}&iDG={CATEGORY}'
+def get(url, **kw):
     last=None
-    for i in range(5):
+    for i in range(4):
         try:
-            r=s.get(url,timeout=40,**kwargs)
+            r=requests.get(url,headers={**HEAD,**kw.pop('headers',{})},timeout=25,**kw)
             if r.status_code==200: return r
             last=RuntimeError(f'HTTP {r.status_code}: {url}')
         except Exception as e: last=e
-        time.sleep(1.2*(i+1))
+        time.sleep(.6*(i+1))
     raise last
 
-def page_url(p): return f'{BASE}?iDG={CATEGORY}&l_sPaper={quote(KEYWORD)}&iPageNo={p}'
+def parse_page(p):
+    r=get(page_url(p)); r.encoding=r.apparent_encoding or 'utf-8'; soup=BeautifulSoup(r.text,'html.parser'); out=[]
+    for tr in soup.find_all('tr'):
+        tds=tr.find_all('td'); a=tr.find('a',href=re.compile(r'Download\.ashx',re.I))
+        if len(tds)<5 or not a: continue
+        c=[x.get_text(' ',strip=True) for x in tds]
+        number,school,subject,year=c[0],c[1],c[2],c[3]
+        if KEYWORD in subject:
+            out.append(dict(page=p,number=number,school=school,subject=subject,year=year,download_url=urljoin(r.url,a.get('href'))))
+    return out
+
 def clean(x):
     x=re.sub(r'[\\/:*?"<>|\r\n\t]+','_',x); x=re.sub(r'\s+',' ',x).strip().strip('.')
     return x[:180] or 'paper'
 
-r0=get(page_url(1)); r0.encoding=r0.apparent_encoding or 'utf-8'
-t0=BeautifulSoup(r0.text,'html.parser').get_text(' ',strip=True)
-m=re.search(r'共\s*([0-9,]+)\s*頁',t0)
+r=get(page_url(1)); r.encoding=r.apparent_encoding or 'utf-8'; text=BeautifulSoup(r.text,'html.parser').get_text(' ',strip=True)
+m=re.search(r'共\s*([0-9,]+)\s*頁',text)
 if not m: raise RuntimeError('Cannot determine page count')
-total=int(m.group(1).replace(',',''))
-print('filtered pages',total,flush=True)
+total=int(m.group(1).replace(',','')); print('category pages',total,flush=True)
 
-matches=[]; seen=set()
-for p in range(1,total+1):
-    r=r0 if p==1 else get(page_url(p)); r.encoding=r.apparent_encoding or 'utf-8'; soup=BeautifulSoup(r.text,'html.parser')
-    n=0
-    for tr in soup.find_all('tr'):
-        tds=tr.find_all('td'); link=tr.find('a',href=re.compile(r'Download\.ashx',re.I))
-        if len(tds)<5 or not link: continue
-        cells=[td.get_text(' ',strip=True) for td in tds]
-        number,school,subject,year=cells[0],cells[1],cells[2],cells[3]
-        if KEYWORD not in subject: continue
-        href=urljoin(r.url,link.get('href'))
-        if href in seen: continue
-        seen.add(href); matches.append(dict(page=p,number=number,school=school,subject=subject,year=year,download_url=href)); n+=1
-    if p%10==0 or n: print('scan',p,'/',total,'new',n,'total',len(matches),flush=True)
-    time.sleep(.03)
-
+matches=[]
+with ThreadPoolExecutor(max_workers=10) as ex:
+    fut={ex.submit(parse_page,p):p for p in range(1,total+1)}
+    done=0
+    for f in as_completed(fut):
+        p=fut[f]; rows=f.result(); matches.extend(rows); done+=1
+        if rows or done%50==0: print('pages done',done,'/',total,'page',p,'new',len(rows),'total matches',len(matches),flush=True)
+# exact category pages make this authoritative; de-duplicate download handlers
+uniq={x['download_url']:x for x in matches}; matches=sorted(uniq.values(),key=lambda x:(x['page'],x['number']))
 if not matches: raise RuntimeError('No matching subjects found')
+print('matching records',len(matches),flush=True)
+
+def download(item):
+    rr=get(item['download_url'],headers={'Referer':page_url(item['page']),'Accept':'application/pdf,*/*;q=0.8'},allow_redirects=True)
+    data=rr.content; pos=data[:1024].find(b'%PDF')
+    if pos<0: raise RuntimeError(f'Not PDF: {rr.headers.get("content-type","")} {rr.url} {len(data)} bytes')
+    if pos: data=data[pos:]
+    uid=parse_qs(urlparse(item['download_url']).query).get('iDP',[str(item['number'])])[0]
+    name=clean(f"{item['year']}_{item['school']}_{item['subject']}_{uid}.pdf")
+    return item,name,rr.url,data
+
 results=[]; failures=[]
-for i,item in enumerate(matches,1):
-    try:
-        rr=get(item['download_url'],headers={'Referer':page_url(item['page']),'Accept':'application/pdf,*/*;q=0.8'},allow_redirects=True)
-        data=rr.content; pos=data[:1024].find(b'%PDF')
-        if pos<0: raise RuntimeError(f'Not PDF: {rr.headers.get("content-type","")} {rr.url} {len(data)} bytes')
-        if pos: data=data[pos:]
-        uid=parse_qs(urlparse(item['download_url']).query).get('iDP',[str(item['number'])])[0]
-        path=OUT/clean(f"{item['year']}_{item['school']}_{item['subject']}_{uid}.pdf")
-        k=2; base=path
-        while path.exists(): path=OUT/f'{base.stem}_{k}.pdf'; k+=1
-        path.write_bytes(data)
-        rec=dict(item,filename=path.name,final_url=rr.url,bytes=len(data),status='ok'); results.append(rec)
-        print(f'[{i}/{len(matches)}] OK',path.name,len(data),flush=True)
-    except Exception as e:
-        rec=dict(item,filename='',final_url='',bytes=0,status=f'ERROR: {e}'); failures.append(rec); print(f'[{i}/{len(matches)}] ERROR',e,flush=True)
-    time.sleep(.05)
+with ThreadPoolExecutor(max_workers=6) as ex:
+    fut={ex.submit(download,x):x for x in matches}; done=0
+    for f in as_completed(fut):
+        item=fut[f]; done+=1
+        try:
+            item,name,final,data=f.result(); path=OUT/name
+            if path.exists(): path=OUT/clean(f"{path.stem}_{item['number']}.pdf")
+            path.write_bytes(data); results.append(dict(item,filename=path.name,final_url=final,bytes=len(data),status='ok'))
+        except Exception as e:
+            failures.append(dict(item,filename='',final_url='',bytes=0,status=f'ERROR: {e}'))
+        if done%10==0 or done==len(matches): print('downloads',done,'/',len(matches),'ok',len(results),'fail',len(failures),flush=True)
 
 fields=['page','number','school','subject','year','download_url','filename','final_url','bytes','status']
 with open('manifest.csv','w',newline='',encoding='utf-8-sig') as f:
-    w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); [w.writerow(x) for x in results+failures]
+    w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(results+failures)
 with open('summary.txt','w',encoding='utf-8') as f:
-    f.write(f'Source iDG={CATEGORY}\nServer-side filter: l_sPaper={KEYWORD}\nLocal filter: 考試科目 contains {KEYWORD}\nPages scanned: {total}\nMatching records: {len(matches)}\nPDFs downloaded: {len(results)}\nFailures: {len(failures)}\n')
+    f.write(f'Source category iDG={CATEGORY}\nFilter: 考試科目 contains {KEYWORD}\nCategory pages scanned: {total}\nMatching records: {len(matches)}\nPDFs downloaded: {len(results)}\nFailures: {len(failures)}\n')
 zip_name='統計考古題_iDG164.zip'
-with zipfile.ZipFile(zip_name,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+with zipfile.ZipFile(zip_name,'w',zipfile.ZIP_DEFLATED,compresslevel=5) as z:
     for p in sorted(OUT.glob('*.pdf')): z.write(p,p.name)
     z.write('manifest.csv'); z.write('summary.txt')
-print('created',zip_name,os.path.getsize(zip_name),'bytes',flush=True)
+print('created',zip_name,os.path.getsize(zip_name),'bytes; failures',len(failures),flush=True)
