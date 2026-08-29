@@ -1,6 +1,6 @@
 import csv, os, re, time, zipfile
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 import requests
 from bs4 import BeautifulSoup
 
@@ -18,10 +18,10 @@ def get(url, **kwargs):
             if r.status_code==200: return r
             last=RuntimeError(f'HTTP {r.status_code}: {url}')
         except Exception as e: last=e
-        time.sleep(1.5*(i+1))
+        time.sleep(1.2*(i+1))
     raise last
 
-def page_url(p): return f'{BASE}?iPageNo={p}&iDG={CATEGORY}'
+def page_url(p): return f'{BASE}?iDG={CATEGORY}&l_sPaper={quote(KEYWORD)}&iPageNo={p}'
 def clean(x):
     x=re.sub(r'[\\/:*?"<>|\r\n\t]+','_',x); x=re.sub(r'\s+',' ',x).strip().strip('.')
     return x[:180] or 'paper'
@@ -31,7 +31,7 @@ t0=BeautifulSoup(r0.text,'html.parser').get_text(' ',strip=True)
 m=re.search(r'共\s*([0-9,]+)\s*頁',t0)
 if not m: raise RuntimeError('Cannot determine page count')
 total=int(m.group(1).replace(',',''))
-print('pages',total,flush=True)
+print('filtered pages',total,flush=True)
 
 matches=[]; seen=set()
 for p in range(1,total+1):
@@ -39,16 +39,15 @@ for p in range(1,total+1):
     n=0
     for tr in soup.find_all('tr'):
         tds=tr.find_all('td'); link=tr.find('a',href=re.compile(r'Download\.ashx',re.I))
-        if len(tds)<4 or not link: continue
+        if len(tds)<5 or not link: continue
         cells=[td.get_text(' ',strip=True) for td in tds]
-        if len(cells)>=5: number,school,subject,year=cells[0],cells[1],cells[2],cells[3]
-        else: continue
+        number,school,subject,year=cells[0],cells[1],cells[2],cells[3]
         if KEYWORD not in subject: continue
         href=urljoin(r.url,link.get('href'))
         if href in seen: continue
         seen.add(href); matches.append(dict(page=p,number=number,school=school,subject=subject,year=year,download_url=href)); n+=1
-    if p%25==0 or n: print('scan',p,'/',total,'new',n,'total',len(matches),flush=True)
-    time.sleep(.05)
+    if p%10==0 or n: print('scan',p,'/',total,'new',n,'total',len(matches),flush=True)
+    time.sleep(.03)
 
 if not matches: raise RuntimeError('No matching subjects found')
 results=[]; failures=[]
@@ -67,13 +66,13 @@ for i,item in enumerate(matches,1):
         print(f'[{i}/{len(matches)}] OK',path.name,len(data),flush=True)
     except Exception as e:
         rec=dict(item,filename='',final_url='',bytes=0,status=f'ERROR: {e}'); failures.append(rec); print(f'[{i}/{len(matches)}] ERROR',e,flush=True)
-    time.sleep(.08)
+    time.sleep(.05)
 
 fields=['page','number','school','subject','year','download_url','filename','final_url','bytes','status']
 with open('manifest.csv','w',newline='',encoding='utf-8-sig') as f:
     w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); [w.writerow(x) for x in results+failures]
 with open('summary.txt','w',encoding='utf-8') as f:
-    f.write(f'Source iDG={CATEGORY}\nFilter: 考試科目 contains {KEYWORD}\nPages scanned: {total}\nMatching records: {len(matches)}\nPDFs downloaded: {len(results)}\nFailures: {len(failures)}\n')
+    f.write(f'Source iDG={CATEGORY}\nServer-side filter: l_sPaper={KEYWORD}\nLocal filter: 考試科目 contains {KEYWORD}\nPages scanned: {total}\nMatching records: {len(matches)}\nPDFs downloaded: {len(results)}\nFailures: {len(failures)}\n')
 zip_name='統計考古題_iDG164.zip'
 with zipfile.ZipFile(zip_name,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
     for p in sorted(OUT.glob('*.pdf')): z.write(p,p.name)
