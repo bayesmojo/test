@@ -1,0 +1,21 @@
+name: Run statistics downloader
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install requests beautifulsoup4
+      - run: python download_stats.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: statistics-papers-iDG164
+          path: |
+            統計考古題_iDG164.zip
+            manifest.csv
+            summary.txt
+          retention-days: 1
+          compression-level: 0
